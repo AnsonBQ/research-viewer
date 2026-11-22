@@ -18,6 +18,40 @@ Built for research work with Claude Code (or any terminal agent) running inside
 └──────────────────────────────┴────────────────────────────┘
 ```
 
+## Harness support
+
+### Claude Code
+
+Run `install.sh` to install the `/show` skill into `~/.claude/skills/show`. Use `/show <path>`
+to display files, `/show` to display the files the conversation just discussed, `/show close` to
+close the pane, or `/show --popup` to show new charts in a Preview window too. Claude also adds clickable
+`http://rv.localhost/<absolute path>` links when it mentions a file you may want to see.
+
+### Pi Agent
+
+Run `install.sh` to install the Pi package when `~/.pi` exists. If Pi is already open, run
+`/reload` once. `/show <path>`, `/show close`, and `/show --popup` run without a model turn.
+`/show` with no argument asks the model to display the files the conversation just discussed. Pi
+also adds clickable `http://rv.localhost/<absolute path>` links for files you may want to see.
+
+Pi also accepts this repository as a package. After installing the viewer CLI, you can switch
+from the installer's local Pi package to a git-managed checkout:
+
+```sh
+pi remove "$HOME/.local/share/research-viewer/pi"
+pi install git:github.com/AnsonBQ/research-viewer
+```
+
+Use one Pi installation method, not both. From a clone, `pi install ./pi` installs only the
+Pi integration. The Pi package needs `research-viewer` on your `PATH`; it does not install the
+viewer CLI or its dependencies. Paths with spaces must be quoted, for example
+`/show "results/equity curve.png"`.
+
+### Other terminal agents
+
+The pane does not depend on an agent integration. Use **Ctrl+B i** to open or close it, and have the
+agent print `http://rv.localhost/<absolute path>` links. Ctrl+click a link to display that file.
+
 ## What it does
 
 - **New charts appear by themselves.** When the agent saves a PNG into a watched folder, the pane
