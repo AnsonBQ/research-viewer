@@ -876,6 +876,10 @@ def doctor() -> None:
     skill = Path.home() / ".claude" / "skills" / "show" / "SKILL.md"
     check("/show skill", skill.exists(), str(skill) if skill.exists() else "not installed",
           "re-run install.sh (needs ~/.claude)", required=False)
+    pi_ext = Path.home() / ".local" / "share" / "research-viewer" / "pi" / "extensions" / "research-viewer.ts"
+    check("Pi /show package", pi_ext.is_file() or not (Path.home() / ".pi").exists(),
+          str(pi_ext) if pi_ext.is_file() else ("Pi not installed" if not (Path.home() / ".pi").exists() else "not installed"),
+          "re-run install.sh, then /reload in Pi", required=False)
     roots = watch_roots()
     check("watched folders", bool(roots), ", ".join(map(str, roots)) or "none",
           "list folders in ~/.config/research-viewer/roots", required=False)
