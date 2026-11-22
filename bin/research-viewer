@@ -14,6 +14,7 @@ Commands (run from any pane; inside Claude Code prefix with `!`, or use the /sho
                        image -> picture, csv/parquet -> table preview, md/txt/json -> text,
                        html/pdf/svg -> snapshot picture (press o for the live version)
   watch [--popup]      the viewer loop itself (what `open` runs)
+  doctor               check dependencies and setup, print the fix for anything missing
 
 Keys inside the viewer
   ← p / → n   older / newer item          [ / ]   previous / next batch
@@ -392,6 +393,55 @@ def watch(popup: bool) -> None:
         print()
 
 
+def doctor() -> None:
+    """Check every dependency and print the fix for anything missing."""
+    ok_all = True
+
+    def check(name: str, ok: bool, detail: str, fix: str = "", required: bool = True) -> None:
+        nonlocal ok_all
+        mark = "\033[32m✓\033[0m" if ok else ("\033[31m✗\033[0m" if required else "\033[33m–\033[0m")
+        print(f" {mark} {name:<22} {detail}")
+        if not ok and fix:
+            print(f"   {'':<22} fix: {fix}")
+        ok_all &= ok or not required
+
+    def version(cmd: list[str]) -> str:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip().splitlines()[0]
+        except (OSError, IndexError, subprocess.TimeoutExpired):
+            return ""
+
+    print("research-viewer doctor\n")
+    check("macOS", sys.platform == "darwin", sys.platform, "macOS only for now (Quick Look)")
+    check("chafa", bool(shutil.which("chafa")), version(["chafa", "--version"]) or "missing", "brew install chafa")
+    check("fswatch", bool(shutil.which("fswatch")), version(["fswatch", "--version"]) or "missing", "brew install fswatch")
+    check("VisiData (f key)", bool(shutil.which("vd")), version(["vd", "--version"]) or "missing",
+          "uv tool install visidata --with pyarrow", required=False)
+    check("Quick Look", bool(shutil.which("qlmanage")), "qlmanage" if shutil.which("qlmanage") else "missing")
+    hv = version(["herdr", "--version"])
+    check("herdr >= 0.9", bool(hv), hv or "missing", "curl -fsSL https://herdr.dev/install.sh | sh  (or brew install herdr)")
+    term = os.environ.get("TERM_PROGRAM", "") or os.environ.get("TERM", "")
+    kitty_ok = term.lower() in {"ghostty", "kitty", "wezterm"} or "kitty" in term.lower() or bool(os.environ.get("HERDR_ENV"))
+    check("graphics terminal", kitty_ok, term or "unknown",
+          "use Ghostty (brew install --cask ghostty), kitty or WezTerm — they speak the Kitty graphics protocol")
+    check("inside herdr", bool(os.environ.get("HERDR_PANE_ID")), os.environ.get("HERDR_PANE_ID", "no"),
+          "start `herdr` first; the side pane needs it", required=False)
+    plugins = version(["sh", "-c", "herdr plugin list 2>/dev/null | grep -c research.viewer"])
+    check("herdr plugin", plugins not in ("", "0"), "research.viewer" if plugins not in ("", "0") else "not registered",
+          "herdr plugin install AnsonBQ/research-viewer")
+    cfg = Path.home() / ".config" / "herdr" / "config.toml"
+    bound = cfg.exists() and "research.viewer.toggle" in cfg.read_text()
+    check("Ctrl+B i binding", bound, str(cfg) if bound else "not bound", "re-run install.sh or see README § Keybinding",
+          required=False)
+    skill = Path.home() / ".claude" / "skills" / "show" / "SKILL.md"
+    check("/show skill", skill.exists(), str(skill) if skill.exists() else "not installed",
+          "re-run install.sh (needs ~/.claude)", required=False)
+    roots = watch_roots()
+    check("watched folders", bool(roots), ", ".join(map(str, roots)) or "none",
+          "list folders in ~/.config/research-viewer/roots", required=False)
+    print("\nall required checks passed" if ok_all else "\nsome required checks failed — see fix lines above")
+
+
 def main(argv: list[str]) -> None:
     cmd, rest = (argv[0], argv[1:]) if argv else ("", [])
     if cmd == "watch":
@@ -400,6 +450,8 @@ def main(argv: list[str]) -> None:
         open_viewer("--popup" in rest)
     elif cmd == "close":
         close_viewer()
+    elif cmd == "doctor":
+        doctor()
     elif cmd == "toggle":
         close_viewer() if viewer_pane() else open_viewer()
     elif cmd == "show" and rest:
