@@ -6,7 +6,8 @@ description: Display a file in the research-viewer side pane next to this sessio
 # /show — put it in the side pane
 
 The viewer is `research-viewer` (~/.local/bin), a herdr side pane that draws images sharply
-(Kitty graphics), shows tables as previews, and snapshots HTML/PDF. It opens itself if closed.
+(Kitty graphics), shows tables as previews, renders markdown, snapshots HTML/PDF, and indexes
+whole research folders by stage. It opens itself if closed.
 
 ## What to run
 
@@ -15,9 +16,13 @@ The viewer is `research-viewer` (~/.local/bin), a herdr side pane that draws ima
 - `/show` with no path → show what the conversation is about: the chart / table / report you
   most recently produced or mentioned (several → pass them all, in the order discussed). If
   nothing was produced this session, just run `research-viewer open`.
+- `/show <folder>` → `research-viewer show <folder>`: the folder index — every file of that research
+  folder split into stages (Report / EDA / P3 / Optimisation / Robustness / P1 / Code / Data /
+  Unassigned, or the stages in the folder's index.json). Use it when the user asks to see "everything"
+  for a strategy or research folder.
 - `/show close` → `research-viewer close`.
 - `/show --popup` → `research-viewer close; research-viewer open --popup` (new charts also pop
-  up in Quick Look, at most one per 20 s).
+  up in a Preview window, at most one per 20 s).
 
 Run it with Bash. Do not Read the image yourself to "display" it — the pane is the display.
 If the command prints "not inside herdr", tell the user to run `research-viewer watch` in any
@@ -29,8 +34,8 @@ One line confirming what is now on screen, then always append this hint block ve
 
 ```
 Ctrl+B i   open / close the viewer pane      (click the pane first for the keys below)
-← →  item     [ ]  batch     h  history     f  full view (tables scroll/sort in VisiData)
-o  open in Quick Look        l  latest      q  quit viewer    x  close pane
+← →  item     1-9 / Tab / click  tabs     [ ]  batch     h  history (type to filter)
+i  folder index (stages)    f  full view in this pane    o  open outside    q quit   x close
 ```
 
 ## Notes

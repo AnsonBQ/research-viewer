@@ -26,8 +26,16 @@ Built for research work with Claude Code (or any terminal agent) running inside
   - Images are drawn at full terminal resolution.
   - CSV and parquet show as a table preview. Press `f` to open the whole table in VisiData,
     where you can scroll, sort and filter.
-  - HTML, PDF and SVG show as a snapshot. Press `o` to open the live version.
-- **History.** Every item is kept and grouped into batches. Closing the pane does not lose it.
+  - Markdown is rendered as a formatted page (headings, tables, code).
+  - HTML, PDF and SVG show as a snapshot. `f` shows the full version inside the pane, `o` opens it outside.
+- **Tabs.** Every file of the batch on screen is a tab at the top: click it, press `1`–`9` or `Tab`.
+  When there are more tabs than fit, the row scrolls so the selected one stays visible.
+- **History.** Batches are kept with their date and time, newest first. Type to filter by file name
+  or path, move with ↑/↓, open with Enter or a click. Closing the pane does not lose it.
+- **Folder index.** `i` (or `research-viewer show <folder>`) lists every file of a research folder,
+  split into stages shown as tabs: Report, EDA, P3 walk-forward, Optimisation, Robustness, P1
+  backtest, Code, Data. A file no stage claims goes to Unassigned, so nothing is hidden. A folder
+  can define its own stages in `index.json` (format below).
 - **Ctrl+click links.** Ctrl+click an `http://rv.localhost/<absolute path>` link anywhere in herdr
   and the file opens in the pane.
 - **`/show` for Claude Code.** `/show <path>` puts a file on screen. `/show` with no argument shows
@@ -39,7 +47,7 @@ Built for research work with Claude Code (or any terminal agent) running inside
 
 | Dependency | Needed for | Required? | Install |
 |---|---|---|---|
-| **macOS** | Quick Look snapshots of HTML/PDF/SVG | yes | — |
+| **macOS** | snapshots of HTML/PDF/SVG, Preview pop-ups | yes | — |
 | **A Kitty-graphics terminal**: Ghostty, kitty or WezTerm | drawing images in the terminal | yes | `brew install --cask ghostty` |
 | **herdr** ≥ 0.9 | the side pane, `Ctrl+B i`, Ctrl+click links | yes, for the pane | `curl -fsSL https://herdr.dev/install.sh \| sh` or `brew install herdr` |
 | **Homebrew** | installing chafa and fswatch | recommended | see [brew.sh](https://brew.sh) |
@@ -50,7 +58,7 @@ Built for research work with Claude Code (or any terminal agent) running inside
 | **Claude Code** | the `/show` skill | optional | [claude.com/claude-code](https://claude.com/claude-code) |
 
 Terminal.app and iTerm2 do **not** speak the Kitty graphics protocol, so images will not draw
-there. The tables, history and Quick Look features still work.
+there. The tables, history and folder index still work.
 
 ## 2. Install
 
@@ -110,7 +118,7 @@ research-viewer doctor
  ✓ chafa                  Chafa version 1.18.3
  ✓ fswatch                fswatch 1.22.0
  ✓ VisiData (f key)       saul.pw/VisiData v3.5
- ✓ Quick Look             qlmanage
+ ✓ Quick Look             qlmanage   (snapshots only)
  ✓ herdr >= 0.9           herdr 0.9.0
  ✓ graphics terminal      ghostty
  ✓ inside herdr           w1:p1
@@ -149,7 +157,8 @@ so data dumps do not flood the pane.
 |---|---|
 | open / close the pane | **Ctrl+B i** (herdr prefix, then `i`), or `research-viewer toggle` |
 | show a file | `research-viewer show FILE…`; Ctrl+click an `http://rv.localhost/<path>` link; `/show <path>` in Claude Code |
-| pop new charts up in Quick Look too | `research-viewer open --popup` (at most one window per 20 s) |
+| index a whole research folder | `research-viewer show FOLDER`, or `i` inside the pane |
+| pop new charts up in a Preview window too | `research-viewer open --popup` (at most one window per 20 s) |
 | check the setup | `research-viewer doctor` |
 
 Keys inside the pane (click the pane first):
@@ -158,10 +167,12 @@ Keys inside the pane (click the pane first):
 |---|---|
 | `←` / `p`, `→` / `n` | older / newer item |
 | `[` / `]` | previous / next batch |
-| `h` | history list: type a number and press Enter to jump; Esc goes back |
+| `1`–`9`, `Tab`, click | switch tab within the batch |
+| `h` | history: newest batch first, each with its time; type to filter, ↑/↓ or wheel to move, Enter/click to open, Esc clears then goes back |
+| `i` | folder index of the current file's research folder |
 | `l` | latest item |
-| `f` | full view: tables in VisiData (`q` to come back), images and HTML in Quick Look |
-| `o` | open the current item in Quick Look |
+| `f` | full view **in this pane**, zoomed to the whole window: images/PDF/SVG at full size, tables in VisiData, HTML as formatted text (or in [carbonyl](https://github.com/fathyb/carbonyl) if installed), markdown rendered; any key or `q` returns |
+| `o` | open outside: Preview for images/PDF, the default app for HTML |
 | `q` | quit the viewer (the pane stays open) |
 | `x` | close the pane |
 
@@ -193,6 +204,31 @@ description = "toggle research viewer"
 Then run `herdr server reload-config`.
 
 ---
+
+### Folder stages (`index.json`)
+
+Without an `index.json` the folder index uses the built-in stages above. To define your own, put an
+`index.json` in the folder (the `research_index` format):
+
+```json
+{
+  "title": "SA-0014 Cross Venue Funding",
+  "stages": [
+    {"id": "data", "title": "Data & universe", "match": ["^1[a-z]_", "universe"]},
+    {"id": "eda",  "title": "EDA",             "match": ["^2[a-z]_", "plots/eda/*"]},
+    {"id": "bt",   "title": "Backtest",        "folder": "03_backtest"}
+  ],
+  "assign": {"some_odd_file.csv": "eda"}
+}
+```
+
+- Stage order is the tab order. The **first** matching stage wins, and `assign` beats `match`.
+- A `match` entry containing `/` or `*`, and no regex characters, is a glob; anything else is a regex,
+  matched against the path relative to the folder.
+- `folder` takes everything under that subfolder.
+- A `links.json` (`[{"label", "path", "note", "stage"}]`) adds files from outside the folder. An
+  unknown `stage` id is shown as an error line.
+- Files no stage claims go to **Unassigned**, so nothing is ever hidden.
 
 ## 4. Troubleshooting
 

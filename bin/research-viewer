@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["polars>=1.0"]
+# dependencies = ["polars>=1.0", "html2text>=2024.2", "rich>=13"]
 # ///
 """research-viewer — show research outputs in a side pane next to the agent, no Finder hunting.
 
@@ -10,6 +10,7 @@ Commands (run from any pane; inside Claude Code prefix with `!`, or use the /sho
                        --popup also pops each new chart up in Quick Look (at most one per 20 s)
   close                close the viewer pane
   toggle               close it if open, open it if closed (what Ctrl+B i runs)
+  show FOLDER          open the folder index (every output, split into stages)
   show FILE [FILE...]  display files in the viewer pane, opening it if needed:
                        image -> picture, csv/parquet -> table preview, md/txt/json -> text,
                        html/pdf/svg -> snapshot picture (press o for the live version)
@@ -17,10 +18,17 @@ Commands (run from any pane; inside Claude Code prefix with `!`, or use the /sho
   doctor               check dependencies and setup, print the fix for anything missing
 
 Keys inside the viewer
+  1-9 / Tab / click   switch tab (the tabs = every file in the current batch)
   ← p / → n   older / newer item          [ / ]   previous / next batch
-  l           latest                      h       history list (type a number + Enter to jump)
-  f           full view: tables scroll in VisiData, text in less, images/HTML in Quick Look
-  o           open in Quick Look          q quit viewer     x close pane
+  i           folder index: every file of this research folder, split into stages (tabs);
+              stages from the folder's index.json or the built-in defaults
+  l           latest                      h       history: newest first, timestamped batches;
+                                                  type to filter, ↑/↓ + Enter or click to open
+  f           full view in this pane, zoomed to the whole window: images/PDF/SVG at full size,
+              tables in VisiData, HTML in carbonyl (if installed) else as formatted text, markdown
+              rendered; any key / q returns
+  o           open outside (Preview for images/PDF, the default app for HTML)
+  q quit viewer     x close pane
 Ctrl+B i toggles the pane from anywhere in herdr.
 
 Watched folders: $RESEARCH_VIEWER_ROOTS (colon-separated) or ~/.config/research-viewer/roots
@@ -30,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -47,11 +56,12 @@ STATE = Path.home() / ".cache" / "research-viewer"
 QUEUE = STATE / "queue.txt"          # `show` from another pane appends paths here
 PANE_FILE = STATE / "pane.json"      # {"pane_id", "pid"} of the running viewer
 HISTORY_FILE = STATE / "history.jsonl"  # survives closing the pane; reopening restores it
-HISTORY_KEEP = 300
+HISTORY_KEEP = 2000
+BULK_LIMIT = 40          # an auto batch bigger than this is a checkout/copy, not new research: skip it
 LINK_PREFIXES = ("http://rv.localhost", "https://rv.localhost", "file://")
 IMAGE = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 TABLE = {".csv", ".parquet"}
-TEXT = {".md", ".txt", ".json"}
+TEXT = {".md", ".txt", ".json", ".jsonl", ".py", ".sh", ".yaml", ".yml", ".toml", ".log", ".sql"}
 OUTSIDE = {".html", ".htm", ".pdf", ".svg"}
 SKIP_PARTS = {".git", ".venv", "node_modules", "__pycache__", "data", "cache"}
 DEBOUNCE_S = 1.5
@@ -65,6 +75,7 @@ class Item:
     path: Path
     batch: int
     source: str          # "auto" (new file) or "show" (asked for)
+    ts: float = 0.0      # when the batch arrived (epoch seconds)
 
 
 def watch_roots() -> list[Path]:
@@ -88,7 +99,10 @@ def term_size() -> tuple[int, int]:
 
 
 def quicklook(path: Path) -> None:
-    subprocess.Popen(["qlmanage", "-p", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Pop the file up in a real macOS window: Preview for images/PDF, the default app otherwise.
+    (`qlmanage -p` is a debugging tool and closes itself immediately on recent macOS.)"""
+    cmd = ["open", "-a", "Preview", str(path)] if path.suffix.lower() in IMAGE | {".pdf"} else ["open", str(path)]
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def draw_image(path: Path, reserve: int) -> None:
@@ -103,9 +117,66 @@ def read_table(path: Path):
     return pl.read_parquet(path) if path.suffix.lower() == ".parquet" else pl.read_csv(path, infer_schema_length=2000)
 
 
-def render(path: Path, pos: str = "", footer: bool = False) -> None:
+TAB_ZONES: list[tuple[int, int, int]] = []   # (first col, last col, tab index) of the drawn tab bar
+ROW_ZONES: dict[int, int] = {}                # history menu: screen row -> position in the filtered list
+MOUSE_ON = "\033[?1000h\033[?1006h"         # ask the terminal for SGR mouse clicks (tab bar)
+MOUSE_OFF = "\033[?1000l\033[?1006l"
+
+
+TAB_W_MIN, TAB_W_MAX = 22, 30
+
+
+def tab_bar(names: list[str], active: int, cols: int) -> str:
+    """One row of tabs for the current batch. When they do not all fit, the row scrolls like
+    herdr's tab bar so the active tab is always visible, with ‹ n / n › markers for the hidden
+    ones (clicking a marker steps one tab). Remembers where each tab sits for mouse clicks."""
+    TAB_ZONES.clear()
+    n = len(names)
+    width = max(TAB_W_MIN, min(TAB_W_MAX, cols // max(n, 1)))
+    marker_w = 5
+    fit = max(1, (cols - 2 * marker_w) // width) if n * width > cols else n
+    start = min(max(0, active - fit // 2), n - fit)          # keep the active tab near the middle
+    end = start + fit
+    out, x = [], 1
+    if start > 0:
+        m = f"‹ {start}".ljust(marker_w - 1) + " "
+        out.append(f"\033[2m{m}\033[0m")
+        TAB_ZONES.append((x, x + len(m) - 1, active - 1))
+        x += len(m)
+    for i in range(start, end):
+        num, name = f" {i + 1} ", names[i]
+        room = width - 2 - len(num)
+        if len(name) > room:                     # keep both ends: "equity_c…oos.png" stays unique
+            head = (room - 1) // 2
+            name = name[:head] + "…" + name[-(room - 1 - head):]
+        label = (num + name).ljust(width - 1)
+        style = "\033[7;1m" if i == active else "\033[48;5;236m"
+        out.append(f"{style}{label}\033[0m ")
+        TAB_ZONES.append((x, x + len(label) - 1, i))
+        x += len(label) + 1
+    if end < n:
+        m = f" {n - end} ›"
+        out.append(f"\033[2m{m}\033[0m")
+        TAB_ZONES.append((x, x + len(m) - 1, min(active + 1, n - 1)))
+    return "".join(out)
+
+
+def snapshot(path: Path) -> Path | None:
+    """PNG snapshot of an HTML/PDF/SVG page via Quick Look's thumbnailer (not the crashing previewer)."""
+    snap = STATE / "snapshots"
+    snap.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["qlmanage", "-t", "-s", "1600", "-o", str(snap), str(path)],
+                   capture_output=True, timeout=30, check=False)
+    png = snap / f"{path.name}.png"
+    return png if png.exists() else None
+
+
+def render(path: Path, pos: str = "", footer: bool = False,
+           tabs: list[str] | None = None, active: int = -1) -> None:
     cols, _ = term_size()
     print("\033[2J\033[H", end="")
+    if tabs:
+        print(tab_bar(tabs, active, cols))
     print(f"\033[1m{path.name}\033[0m  {pos}  ·  {time.strftime('%H:%M:%S')}")
     print(str(path))
     print("─" * min(cols, 120))
@@ -113,7 +184,7 @@ def render(path: Path, pos: str = "", footer: bool = False) -> None:
     if not path.exists():
         print("file no longer exists")
     elif ext in IMAGE:
-        draw_image(path, 7)
+        draw_image(path, 8 if tabs else 7)
     elif ext in TABLE:
         import polars as pl
         df = read_table(path)
@@ -123,47 +194,96 @@ def render(path: Path, pos: str = "", footer: bool = False) -> None:
         print(f"{df.height:,} rows × {df.width} cols   \033[2m(f = full scrollable view)\033[0m")
         print(df)
     elif ext in TEXT:
-        print(path.read_text(errors="replace")[:20000])
+        # never scroll the header away: show what fits, the rest is one keypress away
+        _, lines = term_size()
+        text = md_as_ansi(path, cols) if ext == ".md" else path.read_text(errors="replace")
+        rows = text.splitlines()
+        room = max(lines - (8 if tabs else 7), 3)
+        clipped = [r if len(re.sub(r"\033\[[0-9;]*m", "", r)) <= cols else r[: cols - 1] for r in rows[:room]]
+        print("\n".join(clipped))
+        if len(rows) > room:
+            print(f"\033[2m… {len(rows) - room} more lines — f for the full view\033[0m", end="")
     elif ext in OUTSIDE:
         # a terminal cannot lay out HTML/PDF/SVG: let Quick Look render a snapshot PNG, draw that
-        snap = STATE / "snapshots"
-        snap.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["qlmanage", "-t", "-s", "1600", "-o", str(snap), str(path)],
-                       capture_output=True, timeout=30, check=False)
-        png = snap / f"{path.name}.png"
-        print("\033[2mstatic snapshot — press o for the live, scrollable version\033[0m")
-        if png.exists():
-            draw_image(png, 8)
+        png = snapshot(path)
+        print("\033[2mstatic snapshot — f full view in this pane · o open outside\033[0m")
+        if png and png.exists():
+            draw_image(png, 9 if tabs else 8)
         else:
-            print("snapshot failed; press o to open it in Quick Look")
+            print("snapshot failed; press o to open it outside")
     else:
         print(f"no renderer for {ext}")
     if footer:
-        print("\n\033[2m←/→ item  [/] batch  h history  f full  o open  l latest  q quit  x close\033[0m", end="")
+        print("\n\033[2m1-9/Tab/click tabs  ←/→ item  [/] batch  h history  i folder  f full  o open  q quit  x close\033[0m", end="")
     sys.stdout.flush()
 
 
+def html_as_text(path: Path) -> str:
+    """HTML -> markdown-ish text for the terminal (headings, lists, tables survive)."""
+    import html2text
+    h = html2text.HTML2Text()
+    h.body_width = 0
+    h.ignore_images = True
+    return h.handle(path.read_text(errors="replace"))
+
+
+def md_as_ansi(path: Path, width: int) -> str:
+    """Markdown rendered for the terminal (headings, tables, code, lists), like a formatted page."""
+    from rich.console import Console
+    from rich.markdown import Markdown
+    con = Console(width=width, force_terminal=True, color_system="truecolor", record=False)
+    with con.capture() as cap:
+        con.print(Markdown(path.read_text(errors="replace")))
+    return cap.get()
+
+
+def zoom(on: bool) -> None:
+    """Let the viewer pane fill the whole herdr tab (full view), or give the space back."""
+    pane = os.environ.get("HERDR_PANE_ID")
+    if pane:
+        herdr("pane", "zoom", pane, "--on" if on else "--off")
+        time.sleep(0.25)                       # let the terminal resize before drawing
+
+
 def full_view(path: Path, key_fd: int, saved_tty) -> None:
-    """Hand the terminal to a real scrolling viewer, then come back."""
+    """Full view inside this pane, zoomed to the whole window. Images and PDF/SVG are redrawn at full
+    size (any key returns); tables open in VisiData; HTML in carbonyl when installed, otherwise as
+    formatted text; markdown rendered; text in a pager. `o` is the key for opening outside."""
     ext = path.suffix.lower()
-    if ext in IMAGE | OUTSIDE:
-        quicklook(path)
-        return
-    termios.tcsetattr(key_fd, termios.TCSADRAIN, saved_tty)
+    zoom(True)
     try:
-        if ext in TABLE and shutil.which("vd"):
-            subprocess.run(["vd", str(path)], check=False)        # scroll, sort, filter; q to return
-        elif ext in TABLE | TEXT:
-            if ext in TABLE:
-                import polars as pl
-                df = read_table(path)
-                with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=100000, fmt_str_lengths=200):
-                    text = str(df)
+        if ext in IMAGE or ext in {".pdf", ".svg"}:
+            img = path if ext in IMAGE else snapshot(path)
+            cols, lines = term_size()
+            print("\033[2J\033[H", end="")
+            if img and img.exists():
+                draw_image(img, 2)
+            print(f"\n\033[2m{path.name} — full view · any key to return\033[0m", end="", flush=True)
+            read_key(key_fd)
+            return
+        termios.tcsetattr(key_fd, termios.TCSADRAIN, saved_tty)
+        try:
+            cols, _ = term_size()
+            if ext in {".html", ".htm"} and shutil.which("carbonyl"):   # Chromium in the terminal
+                subprocess.run(["carbonyl", path.as_uri()], check=False)
+            elif ext in TABLE and shutil.which("vd"):
+                subprocess.run(["vd", str(path)], check=False)        # scroll, sort, filter; q to return
             else:
-                text = path.read_text(errors="replace")
-            subprocess.run(["less", "-S", "-R"], input=text.encode(), check=False)
+                if ext in {".html", ".htm"}:
+                    text = html_as_text(path)
+                elif ext == ".md":
+                    text = md_as_ansi(path, cols)
+                elif ext in TABLE:
+                    import polars as pl
+                    with pl.Config(tbl_rows=-1, tbl_cols=-1, tbl_width_chars=100000, fmt_str_lengths=200):
+                        text = str(read_table(path))
+                else:
+                    text = path.read_text(errors="replace")
+                subprocess.run(["less", "-S", "-R"], input=text.encode(), check=False)
+        finally:
+            tty.setcbreak(key_fd)
     finally:
-        tty.setcbreak(key_fd)
+        zoom(False)
 
 
 # ---------------------------------------------------------------- pane management
@@ -230,6 +350,114 @@ def enqueue(paths: list[Path]) -> None:
             f.write(str(p.resolve()) + "\n")
 
 
+
+# ---------------------------------------------------------------- folder index (a research index page, in the pane)
+# Every file under a research folder, split into stages. Stages come from the folder's index.json
+# (the research_index format: "stages" [{id, title, match, folder, note}] + "assign"
+# {path: stage id}; links.json [{label, path, note, stage}] adds outside files), otherwise from the
+# defaults below, which follow a typical quant strategy-folder layout. First matching stage wins,
+# "assign" beats "match", and a file no stage claims lands in "Unassigned": nothing is dropped.
+DEFAULT_STAGES = [
+    {"id": "report", "title": "Report", "match": [r"(^|/)(summary|readme|notes|scrutiny_card|report)[^/]*\.(md|html)$",
+                                                 r"^[^/]+\.md$"]},
+    {"id": "eda", "title": "EDA", "match": [r"(^|/)eda/", r"(^|/)eda_"]},
+    {"id": "p3", "title": "P3 walk-forward", "match": [r"_wf[._]", r"(^|/)wf_", r"stitched", r"per_fold", r"fold_",
+                                                      r"split_"]},
+    {"id": "opt", "title": "Optimisation", "match": [r"param_", r"(^|/)optimiser/", r"step7", r"grid"]},
+    {"id": "robust", "title": "Robustness", "match": [r"bootstrap", r"blind_shift", r"regime", r"trade_mc", r"_mc[._]",
+                                                     r"scrutiny", r"capacity", r"sensitivity"]},
+    {"id": "p1", "title": "P1 backtest", "match": [r"equity_curve", r"drawdown", r"monthly_returns", r"returns_distribution",
+                                                  r"rolling_sharpe", r"signal_price", r"report[^/]*\.parquet$"]},
+    {"id": "code", "title": "Code", "match": [r"\.(py|ipynb|sh)$"]},
+    {"id": "data", "title": "Data", "match": [r"\.(parquet|csv|json|jsonl|txt)$"]},
+]
+INDEX_SKIP_DIRS = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".ipynb_checkpoints"}
+INDEX_MAX_FILES = 3000
+
+
+def _pattern(pat: str):
+    """Pattern rule: a pattern with '/' or '*' that is not a regex is a glob; otherwise a regex."""
+    import fnmatch
+    if ("*" in pat or "/" in pat) and not any(c in pat for c in "^$()|\\[]+"):
+        return lambda rel: fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel, pat.rstrip("/") + "/*")
+    rx = re.compile(pat, re.I)
+    return lambda rel: bool(rx.search(rel))
+
+
+def folder_root(path: Path) -> Path:
+    """The research folder a file belongs to: climb out of assets/, eda/, plots/ … to the folder that
+    has summary.md / README.md / index.json, else the file's own folder."""
+    d = path if path.is_dir() else path.parent
+    for cand in [d, *d.parents][:4]:
+        if any((cand / n).exists() for n in ("index.json", "summary.md", "README.md")):
+            return cand
+    return d
+
+
+def build_index(folder: Path) -> dict:
+    """{title, status, stages: [(id, title, note, [Path])]} for every file under folder."""
+    cfg: dict = {}
+    if (folder / "index.json").exists():
+        try:
+            cfg = json.loads((folder / "index.json").read_text())
+        except ValueError:
+            cfg = {}
+    stages = cfg.get("stages") or DEFAULT_STAGES
+    matchers = [(st, [_pattern(m) for m in st.get("match", [])]) for st in stages]
+    assign = cfg.get("assign", {})
+    files: list[Path] = []
+    for root, dirs, names in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if d not in INDEX_SKIP_DIRS and not d.startswith("."))
+        for n in sorted(names):
+            if n.startswith(".") or n.endswith((".pyc", ".err")) or n in ("index.json", "links.json"):
+                continue
+            files.append(Path(root) / n)
+            if len(files) >= INDEX_MAX_FILES:
+                break
+    buckets: dict[str, list[Path]] = {st["id"]: [] for st in stages}
+    buckets["_unassigned"] = []
+    for f in files:
+        rel = str(f.relative_to(folder))
+        sid = assign.get(rel)
+        if sid not in buckets:
+            sid = None
+            for st, ms in matchers:
+                if (st.get("folder") and rel.startswith(st["folder"].rstrip("/") + "/")) or any(m(rel) for m in ms):
+                    sid = st["id"]
+                    break
+        buckets[sid or "_unassigned"].append(f)
+    errors = []
+    if (folder / "links.json").exists():
+        try:
+            for ln in json.loads((folder / "links.json").read_text()):
+                target = (folder / ln["path"].replace("%20", " ")).resolve()
+                sid = ln.get("stage") or "_unassigned"
+                if sid not in buckets:
+                    errors.append(f"links.json: unknown stage id '{sid}' for {ln['path']}")
+                    sid = "_unassigned"
+                buckets[sid].append(target)
+        except (ValueError, KeyError) as e:
+            errors.append(f"links.json unreadable: {e}")
+    out = [(st["id"], st.get("title", st["id"]), st.get("note", ""), buckets[st["id"]]) for st in stages]
+    out.append(("_unassigned", "Unassigned", "files no stage claims", buckets["_unassigned"]))
+    status = cfg.get("status", "")
+    summary = folder / "summary.md"
+    if not status and summary.exists():          # summary.md frontmatter
+        head = summary.read_text(errors="replace").split("\n---", 1)[0]
+        keys = dict(re.findall(r"^(status|outcome|verdict|killed_reason_code|killed_reason):\s*(.+)$", head, re.M))
+        status = " · ".join(f"{k}: {v.strip()}" for k, v in keys.items())
+    return {"title": cfg.get("title") or folder.name, "status": status, "errors": errors,
+            "stages": [s_ for s_ in out if s_[3] or (cfg.get("stages") and s_[0] != "_unassigned")]
+            or out[-1:], "total": len(files)}
+
+
+def human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
 # ---------------------------------------------------------------- viewer loop
 def wanted(p: Path) -> bool:
     """Auto-show only charts an agent produced: under the Claude Code temp tree that means a
@@ -242,11 +470,34 @@ def wanted(p: Path) -> bool:
 
 
 def read_key(fd: int) -> str:
+    """One key: a character, or left/right/up/down/pgup/pgdn/home/end, wheelup/wheeldown,
+    "esc", or "click:<col>:<row>"."""
     ch = os.read(fd, 1).decode(errors="ignore")
-    if ch == "\x1b":
-        seq = os.read(fd, 2).decode(errors="ignore") if select.select([fd], [], [], 0.05)[0] else ""
-        return {"[D": "p", "[C": "n"}.get(seq, "esc")
-    return ch
+    if ch != "\x1b":
+        return ch
+    if not select.select([fd], [], [], 0.05)[0] or os.read(fd, 1) != b"[":
+        return "esc"
+    c = os.read(fd, 1).decode(errors="ignore")
+    named = {"D": "left", "C": "right", "A": "up", "B": "down", "H": "home", "F": "end"}
+    if c in named:
+        return named[c]
+    if c in "56":                      # ESC [ 5 ~  /  ESC [ 6 ~
+        os.read(fd, 1)
+        return "pgup" if c == "5" else "pgdn"
+    if c != "<":                       # SGR mouse report: ESC [ < button ; col ; row (M press | m release)
+        return ""
+    seq = ""
+    while (c := os.read(fd, 1).decode(errors="ignore")) not in ("M", "m", ""):
+        seq += c
+    try:
+        button, col, row = (int(v) for v in seq.split(";"))
+    except ValueError:
+        return ""
+    if c == "M" and button == 0:
+        return f"click:{col}:{row}"
+    if c == "M" and button in (64, 65):
+        return "wheelup" if button == 64 else "wheeldown"
+    return ""
 
 
 def watch(popup: bool) -> None:
@@ -265,14 +516,19 @@ def watch(popup: bool) -> None:
     buf, last_popup = b"", 0.0
     saved_tty = termios.tcgetattr(key_fd)
     tty.setcbreak(key_fd)
+    print(MOUSE_ON, end="", flush=True)
+
+    members: list[int] = []            # history indexes of the batch on screen = the tabs
 
     def goto(i: int) -> None:
-        nonlocal idx
+        nonlocal idx, members
         if history:
             idx = max(0, min(i, len(history) - 1))
             it = history[idx]
             nb = history[-1].batch
-            render(it.path, f"[{idx + 1}/{len(history)}  batch {it.batch}/{nb}  {it.source}]", footer=True)
+            members = [j for j, h in enumerate(history) if h.batch == it.batch]
+            render(it.path, f"[{idx + 1}/{len(history)}  batch {it.batch}/{nb}  {it.source}]", footer=True,
+                   tabs=[history[j].path.name for j in members], active=members.index(idx))
 
     def goto_batch(step: int) -> None:
         if not history:
@@ -282,55 +538,216 @@ def watch(popup: bool) -> None:
         if members:
             goto(members[-1])
 
-    def add(paths: list[Path], source: str) -> None:
+    def add(paths: list[Path], source: str, focus: Path | None = None) -> None:
         nonlocal batch_no
         batch_no += 1
-        new = [Item(p, batch_no, source) for p in sorted(paths, key=lambda q: q.stat().st_mtime if q.exists() else 0)]
+        ts = time.time()
+        new = [Item(p, batch_no, source, ts)
+               for p in sorted(paths, key=lambda q: q.stat().st_mtime if q.exists() else 0)]
         history.extend(new)
         with HISTORY_FILE.open("a") as f:
-            for it in new:
-                f.write(json.dumps({"path": str(it.path), "batch": it.batch, "source": it.source}) + "\n")
-        goto(len(history) - 1)
+            for it in new:     # "bid" is unique across viewer restarts, so batches never merge
+                f.write(json.dumps({"path": str(it.path), "bid": f"{ts:.3f}", "source": it.source,
+                                    "ts": ts}) + "\n")
+        target = len(history) - 1
+        if focus is not None:
+            target = next((i for i in range(len(history) - len(new), len(history)) if history[i].path == focus), target)
+        goto(target)
 
     # restore the previous session's history (last HISTORY_KEEP items, files that still exist)
     if HISTORY_FILE.exists():
         rows = [json.loads(x) for x in HISTORY_FILE.read_text().splitlines()[-HISTORY_KEEP:] if x.strip()]
         HISTORY_FILE.write_text("".join(json.dumps(r) + "\n" for r in rows))
-        remap: dict[int, int] = {}
+        key = lambda r: str(r.get("bid", f"legacy-{r.get('batch')}"))
+        sizes: dict[str, int] = {}
         for r in rows:
-            if Path(r["path"]).exists():
-                remap.setdefault(r["batch"], len(remap) + 1)
-                history.append(Item(Path(r["path"]), remap[r["batch"]], r["source"]))
+            sizes[key(r)] = sizes.get(key(r), 0) + 1
+        remap: dict[str, int] = {}
+        for r in rows:
+            k = key(r)
+            if (r["source"] == "auto" and sizes[k] > BULK_LIMIT) or not Path(r["path"]).exists():
+                continue
+            remap.setdefault(k, len(remap) + 1)
+            ts = float(r.get("ts") or Path(r["path"]).stat().st_mtime)
+            history.append(Item(Path(r["path"]), remap[k], r["source"], ts))
         batch_no = len(remap)
 
     def history_menu() -> None:
-        print("\033[2J\033[H\033[1mhistory\033[0m  (number + Enter to open, Esc/h to go back)\n")
-        last_b = None
-        for i, it in enumerate(history):
-            if it.batch != last_b:
-                print(f"\033[2m── batch {it.batch} ({it.source})\033[0m")
-                last_b = it.batch
-            mark = "▶" if i == idx else " "
-            print(f" {mark}{i + 1:>3}  {it.path.name}   \033[2m{it.path.parent}\033[0m")
-        print("\n> ", end="", flush=True)
-        typed = ""
+        """Newest batch first, one header per batch with its time. Type to filter (matches file
+        name or path; several words = all must match), ↑/↓/wheel/PgUp/PgDn to move, Enter or
+        click to open, Esc clears the filter, Esc again goes back."""
+        query, sel, top = "", 0, 0
+        home = str(Path.home())
+
+        def build() -> tuple[list[tuple[str, int]], list[int]]:
+            words = query.lower().split()
+            rows: list[tuple[str, int]] = []            # ("head", batch) | ("item", history index)
+            items: list[int] = []
+            for b in sorted({h.batch for h in history}, reverse=True):
+                hits = [i for i, h in enumerate(history) if h.batch == b
+                        and all(w in str(h.path).lower() for w in words)]
+                if hits:
+                    rows.append(("head", b))
+                    for i in reversed(hits):
+                        rows.append(("item", i))
+                        items.append(i)
+            return rows, items
+
+        def short(path: Path, room: int) -> str:
+            # Claude Code temp dirs carry a session id: show it as claude:<first 8 chars>/…
+            t = re.sub(r"^/(private/)?tmp/claude-\d+/[^/]+/([0-9a-f]{8})[0-9a-f-]*", r"claude:\2", str(path))
+            t = t.replace(home, "~", 1)
+            return t if len(t) <= room else "…" + t[-(room - 1):]
+
         while True:
+            cols, lines = term_size()
+            rows, items = build()
+            sel = max(0, min(sel, len(items) - 1))
+            body = max(lines - 4, 3)
+            sel_row = next((r for r, (kind, v) in enumerate(rows) if kind == "item" and items and v == items[sel]), 0)
+            top = min(max(top, sel_row - body + 1), sel_row)
+            top = max(0, min(top, max(len(rows) - body, 0)))
+            out = ["\033[2J\033[H\033[1mhistory\033[0m  \033[2mtype to filter · ↑↓ wheel PgUp/PgDn move · "
+                   "Enter/click open · Esc clear/back\033[0m",
+                   f"filter: {query}\033[7m \033[0m   \033[2m{len(items)} match{'es' if len(items) != 1 else ''}\033[0m",
+                   "─" * min(cols, 160)]
+            ROW_ZONES.clear()
+            for r, (kind, v) in enumerate(rows[top: top + body], start=top):
+                if kind == "head":
+                    group = [h for h in history if h.batch == v]
+                    when = time.strftime("%m-%d %H:%M", time.localtime(group[0].ts)) if group[0].ts else "?"
+                    out.append(f"\033[1;36m── batch {v} · {when} · {group[0].source} · {len(group)} file"
+                               f"{'s' if len(group) != 1 else ''}\033[0m"[: cols + 12])
+                else:
+                    h = history[v]
+                    mark = "\033[7m▶" if items and v == items[sel] else " "
+                    name = h.path.name[: max(cols - 6, 10)]
+                    room = cols - len(name) - 6
+                    parent = short(h.path.parent, room) if room > 8 else ""
+                    out.append(f"{mark} {name}\033[0m  \033[2m{parent}\033[0m")
+                    ROW_ZONES[len(out)] = items.index(v)      # screen row (1-based) -> item
+            print("\n".join(out), end="", flush=True)
             k = read_key(key_fd)
-            if k in ("esc", "h", "q"):
+            if k == "esc":
+                if query:
+                    query, sel, top = "", 0, 0
+                    continue
                 goto(idx)
                 return
             if k in ("\n", "\r"):
-                if typed.isdigit():
-                    goto(int(typed) - 1)
+                if items:
+                    goto(items[sel])
                 else:
                     goto(idx)
                 return
-            if k.isdigit():
-                typed += k
-                print(k, end="", flush=True)
-            elif k in ("\x7f", "\b") and typed:
-                typed = typed[:-1]
-                print("\b \b", end="", flush=True)
+            if k.startswith("click:"):
+                _, _, row = k.split(":")
+                if int(row) in ROW_ZONES:
+                    goto(items[ROW_ZONES[int(row)]])
+                    return
+            elif k in ("up", "wheelup"):
+                sel -= 1
+            elif k in ("down", "wheeldown"):
+                sel += 1
+            elif k == "pgup":
+                sel -= body
+            elif k == "pgdn":
+                sel += body
+            elif k == "home":
+                sel = 0
+            elif k == "end":
+                sel = len(items) - 1
+            elif k in ("\x7f", "\b"):
+                query, sel, top = query[:-1], 0, 0
+            elif len(k) == 1 and k.isprintable():
+                query, sel, top = query + k, 0, 0
+
+    def index_menu(folder: Path) -> None:
+        """Folder index in the pane: stage tabs on top (←/→ or click or 1-9), every file of
+        the stage below (↑/↓, type to filter), Enter/click opens it with the stage's files as tabs."""
+        nonlocal members
+        info = build_index(folder)
+        stages = info["stages"]
+        cur, sel, top, query = 0, 0, 0, ""
+        home = str(Path.home())
+        while True:
+            cols, lines = term_size()
+            sid, stitle, note, files = stages[cur]
+            words = query.lower().split()
+            shown = [f for f in files if all(w in str(f.relative_to(folder) if folder in f.parents else f).lower()
+                                                 for w in words)]
+            sel = max(0, min(sel, len(shown) - 1))
+            body = max(lines - 8, 3)
+            top = min(max(top, sel - body + 1), sel)
+            top = max(0, min(top, max(len(shown) - body, 0)))
+            names = [f"{t} ({len(fs)})" for _, t, _, fs in stages]
+            out = [tab_bar(names, cur, cols),
+                   f"\033[1m{info['title']}\033[0m  \033[2m{str(folder).replace(home, '~', 1)} · {info['total']} files\033[0m"]
+            if info["status"]:
+                out.append(f"\033[1;33m{info['status'][: cols - 2]}\033[0m")
+            for e in info["errors"]:
+                out.append(f"\033[31m{e[: cols - 2]}\033[0m")
+            out.append(f"\033[1;36m── {stitle}\033[0m" + (f"  \033[2m{note}\033[0m" if note else "")
+                       + f"   filter: {query}\033[7m \033[0m  \033[2m{len(shown)} of {len(files)}\033[0m")
+            ROW_ZONES.clear()
+            for i in range(top, min(top + body, len(shown))):
+                f = shown[i]
+                rel = str(f.relative_to(folder)) if folder in f.parents else str(f).replace(home, "~", 1)
+                try:
+                    st_ = f.stat()
+                    meta = f"{human_size(st_.st_size):>8}  {time.strftime('%m-%d %H:%M', time.localtime(st_.st_mtime))}"
+                except OSError:
+                    meta = "   missing"
+                mark = "\033[7m▶" if i == sel else " "
+                room = cols - len(meta) - 5
+                rel = rel if len(rel) <= room else "…" + rel[-(room - 1):]
+                out.append(f"{mark} {rel.ljust(room)}\033[0m \033[2m{meta}\033[0m")
+                ROW_ZONES[len(out)] = i
+            if not shown:
+                out.append("\033[2m  (no files)\033[0m")
+            out.append("\033[2m←/→ 1-9 click stage  ↑/↓ select  type filter  Enter/click open  f full  Esc back\033[0m")
+            print("\033[2J\033[H" + "\n".join(out), end="", flush=True)
+            k = read_key(key_fd)
+            if k == "esc":
+                if query:
+                    query, sel, top = "", 0, 0
+                    continue
+                goto(idx) if history else None
+                return
+            if k in ("\n", "\r") and shown:
+                add(shown, "index", focus=shown[sel])
+                return
+            if k.startswith("click:"):
+                _, col, row = k.split(":")
+                zone = next((z for z in TAB_ZONES if row == "1" and z[0] <= int(col) <= z[1]), None)
+                if zone:
+                    cur, sel, top = zone[2], 0, 0
+                elif int(row) in ROW_ZONES:
+                    add(shown, "index", focus=shown[ROW_ZONES[int(row)]])
+                    return
+            elif k in ("left", "right"):
+                cur = (cur + (1 if k == "right" else -1)) % len(stages)
+                sel, top = 0, 0
+            elif k in ("up", "wheelup"):
+                sel -= 1
+            elif k in ("down", "wheeldown"):
+                sel += 1
+            elif k == "pgup":
+                sel -= body
+            elif k == "pgdn":
+                sel += body
+            elif k == "\t":
+                cur, sel, top = (cur + 1) % len(stages), 0, 0
+            elif k in ("f", "F") and shown and not query:
+                print(MOUSE_OFF, end="", flush=True)
+                full_view(shown[sel], key_fd, saved_tty)
+                print(MOUSE_ON, end="", flush=True)
+            elif k.isdigit() and k != "0" and not query and int(k) <= len(stages):
+                cur, sel, top = int(k) - 1, 0, 0
+            elif k in ("\x7f", "\b"):
+                query, sel, top = query[:-1], 0, 0
+            elif len(k) == 1 and k.isprintable():
+                query, sel, top = query + k, 0, 0
 
     if history:
         goto(len(history) - 1)
@@ -351,9 +768,18 @@ def watch(popup: bool) -> None:
                         pending[p] = now
             if key_fd in ready:
                 k = read_key(key_fd)
-                if k == "p":
+                if k.isdigit() and k != "0" and int(k) <= len(members):
+                    goto(members[int(k) - 1])
+                elif k == "\t" and members:
+                    goto(members[(members.index(idx) + 1) % len(members)])
+                elif k.startswith("click:"):
+                    _, col, row = k.split(":")
+                    zone = next((z for z in TAB_ZONES if row == "1" and z[0] <= int(col) <= z[1]), None)
+                    if zone:
+                        goto(members[zone[2]])
+                elif k in ("p", "left", "wheelup"):
                     goto(idx - 1)
-                elif k == "n":
+                elif k in ("n", "right", "wheeldown"):
                     goto(idx + 1)
                 elif k == "[":
                     goto_batch(-1)
@@ -363,8 +789,12 @@ def watch(popup: bool) -> None:
                     goto(len(history) - 1)
                 elif k == "h" and history:
                     history_menu()
-                elif k == "f" and history:
+                elif k == "i":
+                    index_menu(folder_root(history[idx].path) if history else Path.cwd())
+                elif k in ("f", "F") and history:
+                    print(MOUSE_OFF, end="", flush=True)
                     full_view(history[idx].path, key_fd, saved_tty)
+                    print(MOUSE_ON, end="", flush=True)
                     goto(idx)
                 elif k == "o" and history:
                     quicklook(history[idx].path)
@@ -377,16 +807,26 @@ def watch(popup: bool) -> None:
             if QUEUE.exists() and QUEUE.stat().st_size:
                 req = [Path(x) for x in QUEUE.read_text().splitlines() if x.strip()]
                 QUEUE.write_text("")
-                add(req, "show")
+                dirs = [r for r in req if r.is_dir()]
+                if [r for r in req if not r.is_dir()]:
+                    add([r for r in req if not r.is_dir()], "show")
+                if dirs:
+                    index_menu(dirs[-1])
             if pending and now - max(pending.values()) >= DEBOUNCE_S:
                 batch = [p for p in pending if p.exists()]
                 pending.clear()
+                if len(batch) > BULK_LIMIT:      # git checkout / bulk copy, not fresh research output
+                    with (STATE / "skipped.log").open("a") as f:
+                        f.write(f"{time.strftime('%F %T')} skipped bulk write of {len(batch)} images "
+                                f"under {os.path.commonpath([str(b) for b in batch])}\n")
+                    batch = []
                 if batch:
                     add(batch, "auto")
                     if popup and now - last_popup >= POPUP_MIN_GAP_S:
                         quicklook(history[-1].path)
                         last_popup = now
     finally:
+        print(MOUSE_OFF, end="", flush=True)
         termios.tcsetattr(key_fd, termios.TCSADRAIN, saved_tty)
         proc.terminate()
         PANE_FILE.unlink(missing_ok=True)
