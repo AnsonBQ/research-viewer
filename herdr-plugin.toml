@@ -1,6 +1,6 @@
 id = "research.viewer"
 name = "Research viewer"
-version = "0.1.0"
+version = "0.1.1"
 min_herdr_version = "0.9.0"
 description = "Show charts, tables and reports in a side pane next to your coding agent"
 platforms = ["macos"]

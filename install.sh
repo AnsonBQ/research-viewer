@@ -18,8 +18,16 @@ done
 command -v vd >/dev/null || { say "installing VisiData (full table view)"; uv tool install visidata --with pyarrow >/dev/null; }
 
 mkdir -p "$HOME/.local/bin"
-ln -sf "$ROOT/bin/research-viewer" "$HOME/.local/bin/research-viewer"
-say "CLI: ~/.local/bin/research-viewer -> $ROOT/bin/research-viewer"
+if [ "$1" = "--from-herdr" ]; then
+  # herdr builds in a temporary checkout and moves it afterwards: keep a stable copy instead of linking there
+  SHARE="$HOME/.local/share/research-viewer"; mkdir -p "$SHARE"
+  cp "$ROOT/bin/research-viewer" "$SHARE/research-viewer"; chmod +x "$SHARE/research-viewer"
+  TARGET="$SHARE/research-viewer"
+else
+  TARGET="$ROOT/bin/research-viewer"          # clone install: edits in the clone take effect at once
+fi
+ln -sf "$TARGET" "$HOME/.local/bin/research-viewer"
+say "CLI: ~/.local/bin/research-viewer -> $TARGET"
 
 if [ -d "$HOME/.claude" ]; then
   mkdir -p "$HOME/.claude/skills/show"
