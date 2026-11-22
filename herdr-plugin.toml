@@ -1,0 +1,27 @@
+id = "research.viewer"
+name = "Research viewer"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Show charts, tables and reports in a side pane next to your coding agent"
+platforms = ["macos"]
+
+[[build]]
+command = ["sh", "install.sh", "--from-herdr"]
+
+[[actions]]
+id = "toggle"
+title = "Toggle research viewer pane"
+contexts = ["workspace"]
+command = ["sh", "action.sh", "toggle"]
+
+[[actions]]
+id = "show"
+title = "Show clicked file in research viewer"
+contexts = ["workspace"]
+command = ["sh", "action.sh", "show"]
+
+[[link_handlers]]
+id = "research-file"
+title = "Show in research viewer"
+pattern = "^(https?://rv\\.localhost|file://)?/.*\\.(png|jpe?g|gif|webp|csv|parquet|md|txt|json|html?|pdf|svg)$"
+action = "show"
