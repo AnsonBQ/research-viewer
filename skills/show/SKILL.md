@@ -34,7 +34,7 @@ One line confirming what is now on screen, then always append this hint block ve
 
 ```
 Ctrl+B i   open / close the viewer pane      (click the pane first for the keys below)
-← →  item     1-9 / Tab / click  tabs     [ ]  batch     h  history (type to filter)
+wheel ↑↓  scroll page   ← →  item   1-9 / Tab / click  tabs   [ ]  batch   h  history
 i  folder index (stages)    f  full view in this pane    o  open outside    q quit   x close
 ```
 

@@ -201,6 +201,7 @@ Keys inside the pane (click the pane first):
 |---|---|
 | `←` / `p`, `→` / `n` | older / newer item |
 | `[` / `]` | previous / next batch |
+| wheel, `↑`/`↓`, `PgUp`/`PgDn`, space | scroll inside the page (tables, markdown, text); the header stays put |
 | `1`–`9`, `Tab`, click | switch tab within the batch |
 | `h` | history: newest batch first, each with its time; type to filter, ↑/↓ or wheel to move, Enter/click to open, Esc clears then goes back |
 | `i` | folder index of the current file's research folder |

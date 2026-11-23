@@ -19,6 +19,7 @@ Commands (run from any pane; inside Claude Code prefix with `!`, or use the /sho
 
 Keys inside the viewer
   1-9 / Tab / click   switch tab (the tabs = every file in the current batch)
+  wheel ↑ ↓ PgUp PgDn space   scroll inside the page (tables, markdown, text)
   ← p / → n   older / newer item          [ / ]   previous / next batch
   i           folder index: every file of this research folder, split into stages (tabs);
               stages from the folder's index.json or the built-in defaults
@@ -67,6 +68,7 @@ SKIP_PARTS = {".git", ".venv", "node_modules", "__pycache__", "data", "cache"}
 DEBOUNCE_S = 1.5
 POPUP_MIN_GAP_S = 20
 TABLE_ROWS = 40
+PREVIEW_ROWS = 400       # table rows kept in the scrollable preview (f shows every row)
 SPLIT_RATIO = "0.45"
 
 
@@ -171,6 +173,29 @@ def snapshot(path: Path) -> Path | None:
     return png if png.exists() else None
 
 
+SCROLL = {"path": None, "off": 0, "total": 0, "room": 0}   # in-page scroll of the item on screen
+_ROWS_CACHE: dict[tuple, list[str]] = {}
+
+
+def content_rows(path: Path, cols: int) -> list[str]:
+    """Text lines of a table / markdown / text file as drawn in the pane (cached per size+mtime)."""
+    key = (str(path), path.stat().st_mtime, cols)
+    if key not in _ROWS_CACHE:
+        ext = path.suffix.lower()
+        if ext in TABLE:
+            import polars as pl
+            df = read_table(path)
+            with pl.Config(tbl_width_chars=cols, tbl_rows=PREVIEW_ROWS, tbl_cols=min(df.width, 30)):
+                text = f"{df.height:,} rows × {df.width} cols\n{df}"
+        elif ext == ".md":
+            text = md_as_ansi(path, cols)
+        else:
+            text = path.read_text(errors="replace")
+        _ROWS_CACHE.clear() if len(_ROWS_CACHE) > 50 else None
+        _ROWS_CACHE[key] = text.splitlines()
+    return _ROWS_CACHE[key]
+
+
 def render(path: Path, pos: str = "", footer: bool = False,
            tabs: list[str] | None = None, active: int = -1) -> None:
     cols, _ = term_size()
@@ -185,24 +210,20 @@ def render(path: Path, pos: str = "", footer: bool = False,
         print("file no longer exists")
     elif ext in IMAGE:
         draw_image(path, 8 if tabs else 7)
-    elif ext in TABLE:
-        import polars as pl
-        df = read_table(path)
-        pl.Config.set_tbl_width_chars(cols)
-        pl.Config.set_tbl_rows(TABLE_ROWS)
-        pl.Config.set_tbl_cols(min(df.width, 30))
-        print(f"{df.height:,} rows × {df.width} cols   \033[2m(f = full scrollable view)\033[0m")
-        print(df)
-    elif ext in TEXT:
-        # never scroll the header away: show what fits, the rest is one keypress away
+    elif ext in TABLE or ext in TEXT:
+        # scroll inside the page (wheel, ↑/↓, PgUp/PgDn, space); the header never scrolls away
         _, lines = term_size()
-        text = md_as_ansi(path, cols) if ext == ".md" else path.read_text(errors="replace")
-        rows = text.splitlines()
+        rows = content_rows(path, cols)
         room = max(lines - (8 if tabs else 7), 3)
-        clipped = [r if len(re.sub(r"\033\[[0-9;]*m", "", r)) <= cols else r[: cols - 1] for r in rows[:room]]
-        print("\n".join(clipped))
+        if SCROLL["path"] != str(path):
+            SCROLL.update(path=str(path), off=0)
+        off = max(0, min(SCROLL["off"], max(len(rows) - room, 0)))
+        SCROLL.update(off=off, total=len(rows), room=room)
+        print("\n".join(rows[off: off + room]))
         if len(rows) > room:
-            print(f"\033[2m… {len(rows) - room} more lines — f for the full view\033[0m", end="")
+            pct = int(100 * min(off + room, len(rows)) / len(rows))
+            print(f"\033[2mlines {off + 1}–{min(off + room, len(rows))} of {len(rows)} ({pct}%) · "
+                  f"wheel ↑↓ PgUp/PgDn scroll · f full view\033[0m", end="")
     elif ext in OUTSIDE:
         # a terminal cannot lay out HTML/PDF/SVG: let Quick Look render a snapshot PNG, draw that
         png = snapshot(path)
@@ -214,7 +235,7 @@ def render(path: Path, pos: str = "", footer: bool = False,
     else:
         print(f"no renderer for {ext}")
     if footer:
-        print("\n\033[2m1-9/Tab/click tabs  ←/→ item  [/] batch  h history  i folder  f full  o open  q quit  x close\033[0m", end="")
+        print("\n\033[2mwheel/↑↓ scroll  1-9/Tab/click tabs  ←/→ item  [/] batch  h history  i folder  f full  o open  q quit  x close\033[0m", end="")
     sys.stdout.flush()
 
 
@@ -777,9 +798,18 @@ def watch(popup: bool) -> None:
                     zone = next((z for z in TAB_ZONES if row == "1" and z[0] <= int(col) <= z[1]), None)
                     if zone:
                         goto(members[zone[2]])
-                elif k in ("p", "left", "wheelup"):
+                elif k in ("wheelup", "wheeldown", "up", "down", "pgup", "pgdn", " ", "home", "end"):
+                    step = {"wheelup": -3, "wheeldown": 3, "up": -1, "down": 1,
+                            "pgup": -SCROLL["room"], "pgdn": SCROLL["room"], " ": SCROLL["room"],
+                            "home": -10**9, "end": 10**9}[k]
+                    if history and SCROLL["path"] == str(history[idx].path) and SCROLL["total"] > SCROLL["room"]:
+                        new = max(0, min(SCROLL["off"] + step, SCROLL["total"] - SCROLL["room"]))
+                        if new != SCROLL["off"]:
+                            SCROLL["off"] = new
+                            goto(idx)
+                elif k in ("p", "left"):
                     goto(idx - 1)
-                elif k in ("n", "right", "wheeldown"):
+                elif k in ("n", "right"):
                     goto(idx + 1)
                 elif k == "[":
                     goto_batch(-1)
